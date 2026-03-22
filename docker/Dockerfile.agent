@@ -1,0 +1,22 @@
+FROM freqtradeorg/freqtrade:stable
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir \
+    asyncpg \
+    anthropic \
+    openai \
+    redis \
+    arq \
+    pydantic-settings \
+    python-dotenv \
+    structlog \
+    tenacity \
+    httpx
+
+ENTRYPOINT []
+
+ENV PYTHONPATH=/app
+
+COPY src /app/src
+COPY scripts /app/scripts
