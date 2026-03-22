@@ -1,6 +1,9 @@
-# Freqtrade Strategy Research Agent
+# EvoTrade — Autonomous Trading Strategy Research Agent
 
-An autonomous agent that generates, backtests, evaluates, and iteratively improves Freqtrade trading strategies using a persistent knowledge base and an LLM-powered hypothesis engine.
+Most trading strategy research is a manual grind: tweak an indicator, run a backtest, stare at the results, repeat. EvoTrade automates that entire loop.
+It is an autonomous agent that generates Freqtrade trading strategies using an LLM, backtests them against real market data, scores and stores the results, and feeds every insight — including failures — back into the next round of hypothesis generation. The system gets more informed with every experiment it runs.
+Under the hood, a Bayesian hypothesis engine decides what to test and why, choosing between exploration of new ideas, exploitation of known-good patterns, crossover of successful components, ablation to isolate what actually drives performance, and stress-testing across market regimes. An LLM then generates the strategy code, Freqtrade runs the backtest, and a second LLM pass periodically synthesizes generalizable patterns from the accumulated knowledge base.
+The result is a self-improving research pipeline that runs continuously, learns from its own history, and surfaces insights that would take a human researcher weeks to accumulate.
 
 ## Architecture
 
@@ -16,6 +19,7 @@ An autonomous agent that generates, backtests, evaluates, and iteratively improv
        Backtest Runner (Freqtrade)
       ┌─────────────────────┐
       │ Auto-download data  │  ← On missing OHLCV
+      │ Artifact fallback   │  ← On export format mismatch
       └─────────────────────┘
                ↓
        Evaluator / Scorer
@@ -112,3 +116,88 @@ evotrade/
 ├── docker-compose.yml
 └── README.md
 ```
+
+## Key Fixes & Improvements
+
+### Backtest Runner Resilience
+
+The runner now handles multiple edge cases automatically:
+
+1. **Missing Market Data** — Detects "No history found" errors, auto-runs `freqtrade download-data`, then retries
+2. **Export Format Changes** — If `--export-filename` JSON is missing, falls back to reading `.last_result.json` → `backtest-result-*.zip` artifacts
+3. **Userdir Consistency** — Explicit `--userdir` ensures paths align between download and backtest
+
+### LLM Client Compatibility
+
+- Token parameter handling: `max_completion_tokens` first, with fallback to `max_tokens`
+- Exponential backoff retry on transient failures
+
+### Configuration Hardening
+
+- `api_server` block in `freqtrade.json` includes all required fields (even when `enabled: false`)
+- `pydantic-settings` uses `enable_decoding=False` to handle CSV env vars correctly
+
+## Troubleshooting
+
+### Container won't start
+
+```bash
+# Check compose config
+docker compose config
+
+# Rebuild from scratch
+docker compose down -v
+docker compose up -d --build
+```
+
+### LLM auth errors
+
+Check `.env`:
+- `OPENAI_API_KEY` starts with `sk-...`
+- `LLM_BACKEND=codex` matches your key type
+
+### No data found
+
+This is now auto-handled, but if issues persist:
+```bash
+# Manual download
+docker compose exec freqtrade freqtrade download-data \
+  --config /freqtrade/config.json \
+  --pairs BTC/USDT ETH/USDT SOL/USDT BNB/USDT ADA/USDT \
+  --timeframes 1h 4h 1d
+```
+
+### Results file not found
+
+The runner now auto-fallbacks to `.zip` artifacts. If you see old errors:
+```bash
+# Check what Freqtrade produced
+docker compose exec agent ls -la /freqtrade/user_data/backtest_results/
+```
+
+## Known Limitations
+
+1. **Strategy Generation Quality** — LLM-generated code sometimes has syntax/runtime errors (e.g., incomplete functions, invalid pandas operations). These are logged and fed back to the failure analyzer.
+
+2. **Zero-Trade Strategies** — Many early strategies fail the `min_trade_count` threshold. The agent learns from these and adapts.
+
+3. **Single Exchange** — Currently hardcoded for Binance spot markets.
+
+## Development
+
+```bash
+# Run syntax check
+python -c "import ast,os; [ast.parse(open(fp,'r').read()) for root in ['src','scripts'] for p,_,fs in os.walk(root) for f in fs if f.endswith('.py') and not (e:=print(f'{fp}: {e}'))]"
+
+# Local testing (requires deps)
+python -m src.agent.main --mode run
+```
+
+## License
+
+This project is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE).
+
+- **Free for**: Personal projects, education, academic research, non-profits
+- **Commercial use**: Contact [your-email@example.com] for licensing options
+
+Copyright (c) 2026 [Your Name/Organization]. All rights reserved.
