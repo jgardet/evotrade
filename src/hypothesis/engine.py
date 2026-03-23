@@ -15,7 +15,7 @@ Supports 6 experiment modes:
 from __future__ import annotations
 import math
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import structlog
@@ -85,7 +85,7 @@ class HypothesisEngine:
         hypothesis.outcome = outcome
         hypothesis.outcome_summary = summary
         hypothesis.resulting_strategy_id = resulting_strategy_id
-        hypothesis.completed_at = datetime.utcnow()
+        hypothesis.completed_at = datetime.now(timezone.utc)
         await db.update_hypothesis(hypothesis)
         log.info(
             "hypothesis.closed",
@@ -467,8 +467,15 @@ Return JSON:
         )
 
     def _bootstrap_explore(self, kb: dict[str, Any]) -> Hypothesis:
-        """Very first hypothesis when the library is empty — use the first configured context."""
-        first_context = settings.available_contexts[0]
+        """Very first hypothesis when the library is empty — prefer the least-covered context."""
+        coverage_map = {
+            (c["pair"], c["timeframe"]): c["runs"]
+            for c in kb.get("coverage", [])
+        }
+        first_context = min(
+            settings.available_contexts,
+            key=lambda ctx: coverage_map.get((ctx["pair"], ctx["timeframe"]), 0),
+        )
         return Hypothesis(
             id=uuid.uuid4(),
             type=HypothesisType.EXPLORE,
