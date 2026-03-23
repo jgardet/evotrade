@@ -3,10 +3,11 @@ Strategy Generator — uses the LLM to write valid Freqtrade strategy Python fil
 Takes a hypothesis + selected components and produces runnable code.
 """
 from __future__ import annotations
+import ast
 import re
 import uuid
 import textwrap
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import structlog
@@ -178,6 +179,9 @@ Give it a new descriptive name that reflects the mutation.
         insights: list[dict],
         strategy_name: str,
     ) -> str:
+        if hypothesis.type == HypothesisType.EXPLORE and not components:
+            return self._build_bootstrap_explore_strategy(strategy_name, hypothesis.context)
+
         components_text = "\n\n".join([
             f"--- {c.category.value}: {c.name} ---\n{c.code_snippet}"
             for c in components
@@ -230,7 +234,7 @@ Requirements:
         if code.endswith("```"):
             code = "\n".join(code.split("\n")[:-1])
 
-        code = self._apply_loss_protection_guards(code.strip())
+        code = self._finalize_strategy_code(code.strip(), strategy_name)
 
         return code
 
@@ -284,7 +288,13 @@ Requirements:
         if repaired.endswith("```"):
             repaired = "\n".join(repaired.split("\n")[:-1])
 
-        return self._apply_loss_protection_guards(repaired.strip())
+        return self._finalize_strategy_code(repaired.strip(), strategy_name)
+
+    def _finalize_strategy_code(self, code: str, strategy_name: str) -> str:
+        finalized = self._normalize_strategy_class_name(code, strategy_name)
+        finalized = self._apply_loss_protection_guards(finalized)
+        self._validate_python(finalized, strategy_name)
+        return finalized
 
     def _apply_loss_protection_guards(self, code: str) -> str:
         """Apply deterministic risk guardrails to reduce chronic high-drawdown outputs."""
@@ -391,8 +401,269 @@ Requirements:
         return hardened
 
     def _make_name(self, hypothesis: Hypothesis) -> str:
-        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         return f"Agent_{hypothesis.type.value}_{ts}"
+
+    def _normalize_strategy_class_name(self, code: str, strategy_name: str) -> str:
+        match = re.search(r"^class\s+([A-Za-z_]\w*)\s*\(", code, flags=re.MULTILINE)
+        if not match:
+            raise ValueError("Generated strategy code is missing a strategy class declaration.")
+        current_name = match.group(1)
+        if current_name == strategy_name:
+            return code
+        return re.sub(
+            rf"(^class\s+){re.escape(current_name)}(\s*\()",
+            rf"\1{strategy_name}\2",
+            code,
+            count=1,
+            flags=re.MULTILINE,
+        )
+
+    def _validate_python(self, code: str, strategy_name: str) -> None:
+        try:
+            ast.parse(code)
+        except SyntaxError as exc:
+            raise ValueError(
+                f"Strategy `{strategy_name}` failed Python syntax validation: {exc.msg} "
+                f"(line {exc.lineno})"
+            ) from exc
+
+    def _build_bootstrap_explore_strategy(self, strategy_name: str, context: dict[str, Any]) -> str:
+        pair = str(context.get("pair", "BTC/USDT"))
+        timeframe = str(context.get("timeframe", "1h"))
+        selector = sum(ord(ch) for ch in f"{strategy_name}:{pair}:{timeframe}") % 3
+        builder = [
+            self._bootstrap_ema_pullback_code,
+            self._bootstrap_breakout_code,
+            self._bootstrap_mean_reversion_code,
+        ][selector]
+        return self._finalize_strategy_code(builder(strategy_name, timeframe, pair), strategy_name)
+
+    def _bootstrap_ema_pullback_code(self, strategy_name: str, timeframe: str, pair: str) -> str:
+        return textwrap.dedent(
+            f'''
+            from freqtrade.strategy.interface import IStrategy
+            from pandas import DataFrame
+            import talib.abstract as ta
+
+
+            class {strategy_name}(IStrategy):
+                """
+                Bootstrap EXPLORE strategy for {pair} on {timeframe}.
+                Trend-following pullback entry with simple, high-frequency conditions.
+                """
+                INTERFACE_VERSION = 3
+                can_short = False
+                timeframe = "{timeframe}"
+                startup_candle_count = 240
+
+                minimal_roi = {{
+                    "0": 0.10,
+                    "240": 0.04,
+                    "720": 0.0,
+                }}
+
+                stoploss = -0.05
+                trailing_stop = True
+                trailing_stop_positive = 0.012
+                trailing_stop_positive_offset = 0.025
+                trailing_only_offset_is_reached = True
+                use_exit_signal = True
+                exit_profit_only = False
+                process_only_new_candles = True
+
+                @property
+                def protections(self):
+                    return [
+                        {{"method": "CooldownPeriod", "stop_duration_candles": 4}},
+                        {{"method": "StoplossGuard", "lookback_period_candles": 48, "trade_limit": 2, "stop_duration_candles": 12, "only_per_pair": False}},
+                        {{"method": "MaxDrawdown", "lookback_period_candles": 96, "trade_limit": 20, "stop_duration_candles": 24, "max_allowed_drawdown": 0.12}},
+                    ]
+
+                def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+                    dataframe["ema_fast"] = ta.EMA(dataframe, timeperiod=20)
+                    dataframe["ema_slow"] = ta.EMA(dataframe, timeperiod=50)
+                    dataframe["ema_trend"] = ta.EMA(dataframe, timeperiod=200)
+                    dataframe["rsi"] = ta.RSI(dataframe, timeperiod=14)
+                    dataframe["atr"] = ta.ATR(dataframe, timeperiod=14)
+                    dataframe["atr_pct"] = dataframe["atr"] / dataframe["close"]
+                    dataframe["volume_mean"] = dataframe["volume"].rolling(24).mean()
+                    return dataframe
+
+                def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+                    dataframe.loc[
+                        (
+                            (dataframe["close"] > dataframe["ema_trend"]) &
+                            (dataframe["ema_fast"] > dataframe["ema_slow"]) &
+                            (dataframe["close"] < dataframe["ema_fast"] * 1.01) &
+                            (dataframe["rsi"] > 48) &
+                            (dataframe["rsi"] < 68) &
+                            (dataframe["atr_pct"] > 0.003) &
+                            (dataframe["volume"] > dataframe["volume_mean"] * 0.8)
+                        ),
+                        "enter_long"
+                    ] = 1
+                    return dataframe
+
+                def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+                    dataframe.loc[
+                        (
+                            (dataframe["close"] < dataframe["ema_fast"]) |
+                            (dataframe["rsi"] < 44)
+                        ),
+                        "exit_long"
+                    ] = 1
+                    return dataframe
+            '''
+        ).strip()
+
+    def _bootstrap_breakout_code(self, strategy_name: str, timeframe: str, pair: str) -> str:
+        return textwrap.dedent(
+            f'''
+            from freqtrade.strategy.interface import IStrategy
+            from pandas import DataFrame
+            import talib.abstract as ta
+
+
+            class {strategy_name}(IStrategy):
+                """
+                Bootstrap EXPLORE breakout strategy for {pair} on {timeframe}.
+                Uses a Donchian-style breakout with ADX confirmation and quick defensive exits.
+                """
+                INTERFACE_VERSION = 3
+                can_short = False
+                timeframe = "{timeframe}"
+                startup_candle_count = 240
+
+                minimal_roi = {{
+                    "0": 0.12,
+                    "180": 0.05,
+                    "720": 0.0,
+                }}
+
+                stoploss = -0.045
+                trailing_stop = True
+                trailing_stop_positive = 0.011
+                trailing_stop_positive_offset = 0.022
+                trailing_only_offset_is_reached = True
+                use_exit_signal = True
+                process_only_new_candles = True
+
+                @property
+                def protections(self):
+                    return [
+                        {{"method": "CooldownPeriod", "stop_duration_candles": 3}},
+                        {{"method": "StoplossGuard", "lookback_period_candles": 48, "trade_limit": 2, "stop_duration_candles": 12, "only_per_pair": False}},
+                    ]
+
+                def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+                    dataframe["ema_fast"] = ta.EMA(dataframe, timeperiod=34)
+                    dataframe["ema_slow"] = ta.EMA(dataframe, timeperiod=89)
+                    dataframe["adx"] = ta.ADX(dataframe, timeperiod=14)
+                    dataframe["rsi"] = ta.RSI(dataframe, timeperiod=14)
+                    dataframe["donchian_high"] = dataframe["high"].rolling(24).max().shift(1)
+                    dataframe["donchian_low"] = dataframe["low"].rolling(12).min().shift(1)
+                    dataframe["volume_mean"] = dataframe["volume"].rolling(24).mean()
+                    return dataframe
+
+                def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+                    dataframe.loc[
+                        (
+                            (dataframe["ema_fast"] > dataframe["ema_slow"]) &
+                            (dataframe["close"] > dataframe["donchian_high"]) &
+                            (dataframe["adx"] > 18) &
+                            (dataframe["rsi"] > 52) &
+                            (dataframe["volume"] > dataframe["volume_mean"] * 0.9)
+                        ),
+                        "enter_long"
+                    ] = 1
+                    return dataframe
+
+                def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+                    dataframe.loc[
+                        (
+                            (dataframe["close"] < dataframe["ema_fast"]) |
+                            (dataframe["close"] < dataframe["donchian_low"]) |
+                            (dataframe["rsi"] < 45)
+                        ),
+                        "exit_long"
+                    ] = 1
+                    return dataframe
+            '''
+        ).strip()
+
+    def _bootstrap_mean_reversion_code(self, strategy_name: str, timeframe: str, pair: str) -> str:
+        return textwrap.dedent(
+            f'''
+            from freqtrade.strategy.interface import IStrategy
+            from pandas import DataFrame
+            import talib.abstract as ta
+
+
+            class {strategy_name}(IStrategy):
+                """
+                Bootstrap EXPLORE mean-reversion strategy for {pair} on {timeframe}.
+                Trades pullbacks into the lower Bollinger band while keeping a higher-timeframe trend bias.
+                """
+                INTERFACE_VERSION = 3
+                can_short = False
+                timeframe = "{timeframe}"
+                startup_candle_count = 240
+
+                minimal_roi = {{
+                    "0": 0.08,
+                    "180": 0.03,
+                    "600": 0.0,
+                }}
+
+                stoploss = -0.04
+                trailing_stop = True
+                trailing_stop_positive = 0.01
+                trailing_stop_positive_offset = 0.02
+                trailing_only_offset_is_reached = True
+                use_exit_signal = True
+                process_only_new_candles = True
+
+                def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+                    dataframe["ema_trend"] = ta.EMA(dataframe, timeperiod=100)
+                    dataframe["rsi"] = ta.RSI(dataframe, timeperiod=14)
+                    upper, middle, lower = ta.BBANDS(
+                        dataframe["close"],
+                        timeperiod=20,
+                        nbdevup=2.0,
+                        nbdevdn=2.0,
+                    )
+                    dataframe["bb_upper"] = upper
+                    dataframe["bb_middle"] = middle
+                    dataframe["bb_lower"] = lower
+                    dataframe["bb_width"] = (dataframe["bb_upper"] - dataframe["bb_lower"]) / dataframe["bb_middle"]
+                    dataframe["volume_mean"] = dataframe["volume"].rolling(24).mean()
+                    return dataframe
+
+                def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+                    dataframe.loc[
+                        (
+                            (dataframe["close"] > dataframe["ema_trend"]) &
+                            (dataframe["close"] <= dataframe["bb_lower"] * 1.01) &
+                            (dataframe["rsi"] < 42) &
+                            (dataframe["bb_width"] > 0.02) &
+                            (dataframe["volume"] > dataframe["volume_mean"] * 0.75)
+                        ),
+                        "enter_long"
+                    ] = 1
+                    return dataframe
+
+                def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+                    dataframe.loc[
+                        (
+                            (dataframe["close"] >= dataframe["bb_middle"]) |
+                            (dataframe["rsi"] > 58)
+                        ),
+                        "exit_long"
+                    ] = 1
+                    return dataframe
+            '''
+        ).strip()
 
     def _extract_parameters(self, components: list[Component]) -> dict[str, Any]:
         merged = {}
