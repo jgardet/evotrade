@@ -14,7 +14,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 import structlog
@@ -117,7 +117,7 @@ class AgentLoop:
 
         # Mark as running
         hypothesis.status = HypothesisStatus.RUNNING
-        hypothesis.started_at = datetime.utcnow()
+        hypothesis.started_at = datetime.now(timezone.utc)
         await db.update_hypothesis(hypothesis)
 
         try:
@@ -960,7 +960,7 @@ Original strategy code:
                         if row.get("parent_id") else None
                     ),
                     tags=list(row.get("tags") or []),
-                    created_at=row.get("created_at") or datetime.utcnow(),
+                    created_at=row.get("created_at") or datetime.now(timezone.utc),
                 )
             )
         return components
