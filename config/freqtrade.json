@@ -3,7 +3,7 @@
   "dry_run": true,
   "dry_run_wallet": 1000,
   "trading_mode": "spot",
-  "max_open_trades": 3,
+  "max_open_trades": 1,
   "stake_currency": "USDT",
   "stake_amount": "unlimited",
   "timeframe": "1h",

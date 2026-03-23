@@ -91,7 +91,11 @@ class BacktestRunner:
         run_id = uuid.uuid4()
         oos_delta = None  # set externally when we have both in-sample and holdout runs
         stability = self._compute_trade_stability(raw, strategy.name)
-        score, disqualified, reason = self._compute_composite_score(metrics, stability)
+        score, disqualified, reason = self._compute_composite_score(
+            metrics,
+            stability,
+            strategy_name=strategy.name,
+        )
 
         return BacktestRun(
             id=run_id,
@@ -392,7 +396,10 @@ class BacktestRunner:
             return None
 
     def _compute_composite_score(
-        self, metrics: BacktestMetrics, stability: Optional[float]
+        self,
+        metrics: BacktestMetrics,
+        stability: Optional[float],
+        strategy_name: str = "",
     ) -> tuple[Optional[float], bool, Optional[str]]:
         """
         Returns (score, disqualified, reason).
@@ -401,7 +408,11 @@ class BacktestRunner:
         # Hard disqualifiers
         if (metrics.trade_count or 0) < settings.min_trade_count:
             return None, True, f"Insufficient trades: {metrics.trade_count} < {settings.min_trade_count}"
-        if metrics.max_drawdown and metrics.max_drawdown > settings.max_drawdown_threshold:
+        drawdown_threshold = settings.max_drawdown_threshold
+        if self._is_explore_strategy(strategy_name):
+            drawdown_threshold = settings.explore_max_drawdown_threshold
+
+        if metrics.max_drawdown and metrics.max_drawdown > drawdown_threshold:
             return None, True, f"Max drawdown too high: {metrics.max_drawdown:.1%}"
         if metrics.sharpe is None:
             return None, True, "Could not compute Sharpe ratio"
@@ -419,6 +430,9 @@ class BacktestRunner:
         score = base + stab_bonus
 
         return round(score, 4), False, None
+
+    def _is_explore_strategy(self, strategy_name: str) -> bool:
+        return strategy_name.startswith("Agent_EXPLORE_")
 
     async def _detect_regime(
         self, pair: str, timeframe: str, date_from: date, date_to: date

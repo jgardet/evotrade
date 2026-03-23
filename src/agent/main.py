@@ -26,6 +26,7 @@ from src.models import (
     ComponentCategory,
     ComponentOrigin,
     HypothesisOutcome, HypothesisStatus, HypothesisType,
+    Strategy,
     StrategyStatus, ComponentPerformance, RegimeTrend, RegimeVol,
 )
 from src.hypothesis.engine import engine
@@ -195,6 +196,55 @@ class AgentLoop:
         )
         await db.save_backtest_run(run)
 
+        if run.disqualified and self._is_runtime_disqualification(run.disqualification_reason):
+            try:
+                repaired_code = await generator.repair_strategy_code(
+                    strategy_name=strategy.name,
+                    broken_code=strategy.code,
+                    runtime_error=run.disqualification_reason or "",
+                    context=context,
+                    insights=insights,
+                )
+                repaired_strategy = Strategy(
+                    id=uuid.uuid4(),
+                    name=f"{strategy.name}_retry1",
+                    code=repaired_code,
+                    component_ids=list(strategy.component_ids),
+                    parameters=dict(strategy.parameters),
+                    hypothesis_id=hypothesis.id,
+                    parent_ids=[strategy.id],
+                    generation=strategy.generation + 1,
+                    status=StrategyStatus.CREATED,
+                )
+                await db.save_strategy(repaired_strategy)
+                await db.update_strategy_status(repaired_strategy.id, StrategyStatus.BACKTESTING)
+
+                retry_run = await runner.run(
+                    repaired_strategy,
+                    pair,
+                    timeframe,
+                    settings.in_sample_start,
+                    settings.in_sample_end,
+                )
+                await db.save_backtest_run(retry_run)
+
+                await db.update_strategy_status(strategy.id, StrategyStatus.ARCHIVED)
+                strategy = repaired_strategy
+                run = retry_run
+                log.info(
+                    "strategy.runtime_retry.completed",
+                    original_strategy=strategy.parent_ids[0] if strategy.parent_ids else None,
+                    repaired_strategy=strategy.name,
+                    disqualified=run.disqualified,
+                    reason=run.disqualification_reason,
+                )
+            except Exception as repair_error:
+                log.warning(
+                    "strategy.runtime_retry.failed",
+                    strategy=strategy.name,
+                    error=str(repair_error),
+                )
+
         if run.disqualified:
             await db.update_strategy_status(strategy.id, StrategyStatus.FAILED)
             # Gap 1: analyze failure structure before closing
@@ -278,6 +328,17 @@ class AgentLoop:
             )
 
         return outcome, summary, strategy.id
+
+    def _is_runtime_disqualification(self, reason: str | None) -> bool:
+        if not reason:
+            return False
+        lowered = reason.lower()
+        return (
+            "freqtrade exited with code" in lowered
+            or "traceback" in lowered
+            or "typeerror" in lowered
+            or "syntaxerror" in lowered
+        )
 
     async def _run_exploit(self, hypothesis):
         """Bayesian parameter optimization using Optuna — enriched with failure context."""

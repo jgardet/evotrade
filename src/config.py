@@ -65,6 +65,7 @@ class Settings(BaseSettings):
     # Agent thresholds
     # ----------------------------------------------------------------
     max_drawdown_threshold: float = 0.25
+    explore_max_drawdown_threshold: float = 0.40
     min_trade_count: int = 30
     oos_holdout_ratio: float = 0.2
     insight_synthesis_every: int = 20
